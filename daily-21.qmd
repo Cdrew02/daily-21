@@ -1,0 +1,50 @@
+---
+title: "daily 21"
+format: html
+output-dir: docs
+---
+```{r}
+# Load necessary packages
+library(tidyverse)
+library(dataRetrieval)
+library(tsibble)
+library(feasts)
+library(lubridate)
+library(plotly)
+
+# Download and prepare data
+poudre_flow <- readNWISdv(siteNumber = "06752260",
+                          parameterCd = "00060",
+                          startDate = "2013-01-01",
+                          endDate = "2023-12-31") |>
+  renameNWISColumns() |>
+  mutate(Date = yearmonth(Date)) |>
+  group_by(Date) |>
+  summarise(Flow = mean(Flow, na.rm = TRUE))
+
+poudre_ts <- poudre_flow |>
+  as_tsibble(index = Date)
+
+# Static ggplot
+ts_plot <- ggplot(poudre_ts, aes(x = Date, y = Flow)) +
+  geom_line(color = "steelblue") +
+  labs(title = "Monthly Streamflow: Cache la Poudre River",
+       x = "Date", y = "Flow (cfs)") +
+  theme_minimal()
+
+# Animated version
+ggplotly(ts_plot)
+poudre_ts |>
+  gg_subseries(Flow) +
+  labs(title = "Seasonal Subseries Plot of Streamflow",
+       y = "Average Flow (cfs)")
+# STL decomposition 
+decomp <- poudre_ts |>
+  model(STL(Flow ~ season(window = "periodic"))) |>
+  components()
+
+# Plot components
+autoplot(decomp) +
+  labs(title = "STL Decomposition of Streamflow")
+```
+
