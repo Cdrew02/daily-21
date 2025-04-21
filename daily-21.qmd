@@ -1,8 +1,16 @@
 ---
 title: "daily 21"
-format: html
-output-dir: docs
+subtitle: "Ecosystem Science and Sustainability 330"
+author:
+  - name: Chris Drew
+    email: "cdrew02@colostate.edu"
+format: 
+  html:
+    output-dir: docs
+execute:
+  echo: true
 ---
+
 ```{r}
 # Load necessary packages
 library(tidyverse)
