@@ -12,131 +12,94 @@ execute:
 ---
 
 ```{r}
-# Load necessary packages
-library(tidyverse)
-library(dataRetrieval)
-library(tsibble)
-library(feasts)
-library(lubridate)
-library(plotly)
+library(osmdata)
+library(sf)
+library(dplyr)
+library(aws.s3)
+library(terra)
+library(ggplot2)
 
-# Download and prepare data
-poudre_flow <- readNWISdv(siteNumber = "06752260",
-                          parameterCd = "00060",
-                          startDate = "2013-01-01",
-                          endDate = "2023-12-31") |>
-  renameNWISColumns() |>
-  mutate(Date = yearmonth(Date)) |>
-  group_by(Date) |>
-  summarise(Flow = mean(Flow, na.rm = TRUE))
+# Load the DEM
+r <- rast("data/poudre-elev.tif")
 
-poudre_ts <- poudre_flow |>
-  as_tsibble(index = Date)
+# Query Fort Collins boundary from OpenStreetMap
+fc_query <- opq("Fort Collins, Colorado") |> 
+  add_osm_feature(key = "admin_level", value = "8") |>  # city-level boundaries
+  osmdata_sf()
 
-# Static ggplot
-ts_plot <- ggplot(poudre_ts, aes(x = Date, y = Flow)) +
-  geom_line(color = "steelblue") +
-  labs(title = "Monthly Streamflow: Cache la Poudre River",
-       x = "Date", y = "Flow (cfs)") +
+# Extract the polygon geometry
+fc <- fc_query$osm_multipolygons |> 
+  filter(name == "Fort Collins") |> 
+  st_transform(4326)  # ensure it's in WGS84
+
+# Get river data from OSM
+foco_rivers <- opq(st_bbox(st_transform(fc, 4326))) |> 
+  add_osm_feature("waterway") |> 
+  osmdata_sf()
+
+# === FIXED river extraction steps ===
+
+# Transform river geometries to match DEM CRS
+rivers_transformed <- st_transform(foco_rivers$osm_lines, crs(r))
+
+# Clip to bounding box of DEM
+rivers_clipped <- st_intersection(rivers_transformed, st_as_sfc(st_bbox(r)))
+
+# Filter to Cache la Poudre only
+poudre_rivers <- rivers_clipped %>%
+  filter(grepl("Poudre", name, ignore.case = TRUE))
+
+# Calculate lengths and select the longest segment
+poudre_rivers <- poudre_rivers %>%
+  mutate(length = st_length(geometry)) %>%
+  slice_max(length, n = 1)
+
+# Final river segment
+river <- poudre_rivers
+
+# Plot DEM and river
+plot(r)
+plot(river, add = TRUE, col = "blue", lwd = 2)
+
+# Extract inlet and outlet points
+inlet  <- head(st_cast(river, "POINT"), 1)
+outlet <- tail(st_cast(river, "POINT"), 1)
+pts    <- bind_rows(inlet, outlet)
+
+# Plot inlet and outlet
+plot(r)
+plot(river, add = TRUE, col = "blue", lwd = 2)
+plot(pts$geometry, add = TRUE, col = c("green", "red"), pch = 16)
+
+# Extract DEM values at inlet and outlet
+elev <- extract(r, vect(pts))
+
+# Combine elevation data with coordinates
+profile_df <- bind_cols(
+  st_coordinates(pts) |> as_tibble(),
+  elev
+) |>
+  mutate(ID = row_number())
+
+# Create straight-line connection
+line <- st_cast(st_union(pts), "LINESTRING")
+
+# Compute sinuosity
+river_length <- st_length(river)
+straight_length <- st_length(line)
+sinuosity <- river_length / straight_length
+print(sinuosity)
+
+# Compute slope
+slope <- 100 * (elev$dem[1] - elev$dem[2]) / as.numeric(river_length)
+print(slope)
+
+# Plot elevation profile
+ggplot(profile_df, aes(x = ID, y = dem)) +
+  geom_line(color = "blue") +
+  labs(title = "River Elevation Profile",
+       x = "River Point ID", y = "Elevation (cm)") +
   theme_minimal()
-
-# Animated version
-ggplotly(ts_plot)
-poudre_ts |>
-  gg_subseries(Flow) +
-  labs(title = "Seasonal Subseries Plot of Streamflow",
-       y = "Average Flow (cfs)")
-# STL decomposition 
-decomp <- poudre_ts |>
-  model(STL(Flow ~ season(window = "periodic"))) |>
-  components()
-
-# Plot components
-autoplot(decomp) +
-  labs(title = "STL Decomposition of Streamflow")
-```
-```{r}
-library(tidyverse)
-library(lubridate)
-library(tsibble)
-library(timetk)
-library(modeltime)
-library(tidymodels)
-library(prophet)
-library(dataRetrieval)
-library(rsample)
-
-# Load and prep historical data
-poudre_flow <- readNWISdv(siteNumber = "06752260",
-                          parameterCd = "00060",
-                          startDate = "2013-01-01",
-                          endDate = "2023-12-31") |>
-  renameNWISColumns() |>
-  mutate(Date = floor_date(as.Date(Date), "month")) |>
-  group_by(Date) |>
-  summarise(Flow = mean(Flow, na.rm = TRUE)) |>
-  ungroup()
-
-# Time split for training/testing
-splits <- initial_time_split(poudre_flow, prop = 0.91)
-
-# ARIMA model
-model_arima <- arima_reg() %>%
-  set_engine("auto_arima") %>%
-  fit(Flow ~ Date, data = training(splits))
-
-# Prophet model
-model_prophet <- prophet_reg() %>%
-  set_engine("prophet") %>%
-  fit(Flow ~ Date, data = training(splits))
-
-# Combine models into table
-models_tbl <- modeltime_table(model_arima, model_prophet)
-
-# Create future frame: forecast 12 months ahead (2024)
-future_tbl <- poudre_flow %>%
-  future_frame(.date_var = Date, .length_out = 12, .bind_data = FALSE)
-
-# Forecast into 2024
-forecast_tbl <- models_tbl %>%
-  modeltime_forecast(new_data = future_tbl, actual_data = poudre_flow)
-
-# Load observed future data (2024)
-obs_future <- readNWISdv(siteNumber = "06752260",
-                         parameterCd = "00060",
-                         startDate = "2024-01-01",
-                         endDate = "2024-12-31") |>
-  renameNWISColumns() |>
-  mutate(Date = floor_date(as.Date(Date), "month")) |>
-  group_by(Date) |>
-  summarise(Flow = mean(Flow, na.rm = TRUE)) |>
-  ungroup()
-
-# Filter Prophet predictions only
-predicted <- forecast_tbl %>%
-  filter(.model_desc == "PROPHET") %>%
-  select(.index, .value) %>%
-  rename(Date = .index, Predicted = .value)
-
-# Merge predictions with observed
-comparison_df <- left_join(predicted, obs_future, by = "Date") %>%
-  rename(Observed = Flow)
-
-# Calculate R²
-lm_model <- lm(Observed ~ Predicted, data = comparison_df)
-summary(lm_model)$r.squared
-
-# Plot Predicted vs Observed
-ggplot(comparison_df, aes(x = Predicted, y = Observed)) +
-  geom_point(color = "blue") +
-  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "gray") +
-  geom_smooth(method = "lm", se = FALSE, color = "red") +
-  labs(title = "Predicted vs Observed Monthly Streamflow",
-       x = "Predicted Flow (cfs)",
-       y = "Observed Flow (cfs)") +
-  theme_minimal()
-
-#HELLO CHANGE!
 
 ```
 
