@@ -55,4 +55,92 @@ decomp <- poudre_ts |>
 autoplot(decomp) +
   labs(title = "STL Decomposition of Streamflow")
 ```
+```{r}
+library(tidyverse)
+library(lubridate)
+library(tsibble)
+library(timetk)
+library(modeltime)
+library(tidymodels)
+library(prophet)
+library(dataRetrieval)
+library(rsample)
+
+# Load and prep historical data
+poudre_flow <- readNWISdv(siteNumber = "06752260",
+                          parameterCd = "00060",
+                          startDate = "2013-01-01",
+                          endDate = "2023-12-31") |>
+  renameNWISColumns() |>
+  mutate(Date = floor_date(as.Date(Date), "month")) |>
+  group_by(Date) |>
+  summarise(Flow = mean(Flow, na.rm = TRUE)) |>
+  ungroup()
+
+# Time split for training/testing
+splits <- initial_time_split(poudre_flow, prop = 0.91)
+
+# ARIMA model
+model_arima <- arima_reg() %>%
+  set_engine("auto_arima") %>%
+  fit(Flow ~ Date, data = training(splits))
+
+# Prophet model
+model_prophet <- prophet_reg() %>%
+  set_engine("prophet") %>%
+  fit(Flow ~ Date, data = training(splits))
+
+# Combine models into table
+models_tbl <- modeltime_table(model_arima, model_prophet)
+
+# Create future frame: forecast 12 months ahead (2024)
+future_tbl <- poudre_flow %>%
+  future_frame(.date_var = Date, .length_out = 12, .bind_data = FALSE)
+
+# Forecast into 2024
+forecast_tbl <- models_tbl %>%
+  modeltime_forecast(new_data = future_tbl, actual_data = poudre_flow)
+
+# Load observed future data (2024)
+obs_future <- readNWISdv(siteNumber = "06752260",
+                         parameterCd = "00060",
+                         startDate = "2024-01-01",
+                         endDate = "2024-12-31") |>
+  renameNWISColumns() |>
+  mutate(Date = floor_date(as.Date(Date), "month")) |>
+  group_by(Date) |>
+  summarise(Flow = mean(Flow, na.rm = TRUE)) |>
+  ungroup()
+
+# Filter Prophet predictions only
+predicted <- forecast_tbl %>%
+  filter(.model_desc == "PROPHET") %>%
+  select(.index, .value) %>%
+  rename(Date = .index, Predicted = .value)
+
+# Merge predictions with observed
+comparison_df <- left_join(predicted, obs_future, by = "Date") %>%
+  rename(Observed = Flow)
+
+# Calculate R²
+lm_model <- lm(Observed ~ Predicted, data = comparison_df)
+summary(lm_model)$r.squared
+
+# Plot Predicted vs Observed
+ggplot(comparison_df, aes(x = Predicted, y = Observed)) +
+  geom_point(color = "blue") +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "gray") +
+  geom_smooth(method = "lm", se = FALSE, color = "red") +
+  labs(title = "Predicted vs Observed Monthly Streamflow",
+       x = "Predicted Flow (cfs)",
+       y = "Observed Flow (cfs)") +
+  theme_minimal()
+
+#HELLO CHANGE!
+
+```
+
+```{r}
+
+```
 
